@@ -629,6 +629,7 @@ class ReaderState {
   // the rest wait in `waiters`, so a single consumer never touches the array
   waiter: FiberImpl | undefined = undefined
   waiters: Array<FiberImpl> = []
+  wakeScheduled = false
   // pushed on a parked fiber's stack, shared by every park
   readonly unpark: Primitive = unpark(this)
   handle: NativeHandle | undefined = undefined
@@ -671,18 +672,26 @@ class ReaderState {
 
   push(payload: Uint8Array, host: string, port: number) {
     if (this.failure !== undefined) return
-    // a parked pull implies an empty queue, so it never overflows
     if (this.buffer.length >= this.capacity) return this.overflow(payload, host, port)
-    const datagram = new DatagramImpl(payload, host, port, this)
-    if (this.waiter !== undefined) return this.wake(datagram)
     const buffer = this.buffer
-    buffer[buffer.length] = datagram
+    buffer[buffer.length] = new DatagramImpl(payload, host, port, this)
+    if (this.waiter !== undefined && !this.wakeScheduled) this.scheduleWake(this.waiter)
   }
 
-  wake(datagram: DatagramImpl) {
-    const fiber = this.waiter!
+  // Packets that arrive before the wake runs join the same batch, so a parked
+  // pull is resumed once per scheduler turn rather than once per packet
+  scheduleWake(fiber: FiberImpl) {
+    this.wakeScheduled = true
+    fiber.currentDispatcher.scheduleTask(this.wake, 0)
+  }
+
+  readonly wake = () => {
+    this.wakeScheduled = false
+    const fiber = this.waiter
+    // the waiter was interrupted, or another pull or `close` took the queue
+    if (fiber === undefined || this.buffer.length === 0) return
     this.promoteWaiter()
-    fiber.evaluate(exitSucceed([datagram]) as any)
+    fiber.evaluate(exitSucceed(this.take()) as any)
   }
 
   overflow(payload: Uint8Array, host: string, port: number) {
@@ -729,6 +738,12 @@ class ReaderState {
   fail(error: DatagramSocketError) {
     if (this.failure !== undefined) return
     this.failure = Effect.fail(error)
+    // queued packets reach the oldest waiter before the error does
+    const fiber = this.waiter
+    if (fiber !== undefined && this.buffer.length !== 0) {
+      this.promoteWaiter()
+      fiber.evaluate(exitSucceed(this.take()) as any)
+    }
     this.failWaiters(this.failure)
   }
 
