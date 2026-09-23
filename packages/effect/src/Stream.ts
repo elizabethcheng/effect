@@ -17,6 +17,7 @@ import * as Cause from "./Cause.ts"
 import * as Channel from "./Channel.ts"
 import { Clock } from "./Clock.ts"
 import * as Context from "./Context.ts"
+import * as Deferred from "./Deferred.ts"
 import * as Duration from "./Duration.ts"
 import * as Effect from "./Effect.ts"
 import * as Equal from "./Equal.ts"
@@ -9101,22 +9102,28 @@ const makeBroadcastHub = Effect.fnUntraced(function*<A, E, R>(
 ) {
   const pubsub = yield* makePubSub<Take.Take<A, E>>(options)
   let ended: Exit.Exit<void, E> | undefined
+  const done = Deferred.makeUnsafe<void>()
   const run = (self: Stream<A, E, R>) =>
     Channel.runForEach(self.channel, (value) => PubSub.publish(pubsub, value)).pipe(
       Effect.onExit((exit) => {
         ended = exit
-        return PubSub.publish(pubsub, exit)
+        return Deferred.succeed(done, undefined)
       })
     )
   const subscribe = Effect.map(PubSub.subscribe(pubsub), (subscription) => {
     const take = PubSub.take(subscription)
-    return Channel.fromEffectTake(
-      Effect.suspend(() =>
-        ended !== undefined && Option.getOrUndefined(PubSub.remainingUnsafe(subscription)) === 0
-          ? Effect.succeed(ended)
-          : take
-      )
+    const next = Effect.suspend(() =>
+      ended !== undefined && Option.getOrUndefined(PubSub.remainingUnsafe(subscription)) === 0
+        ? Effect.succeed(ended)
+        : take
     )
+    // Wake a pending take even if this subscriber missed the upstream exit.
+    // A shut-down subscription must still interrupt through PubSub.take.
+    return Channel.fromEffectTake(Effect.suspend(() =>
+      ended === undefined
+        ? Effect.raceFirst(take, Effect.andThen(Deferred.await(done), next))
+        : next
+    ))
   })
   return { run, subscribe } as const
 })
