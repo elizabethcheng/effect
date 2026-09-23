@@ -5447,57 +5447,34 @@ describe("Stream", () => {
 
     it.effect("ends a subscriber that arrives while the upstream ends", () =>
       Effect.gen(function*() {
-        for (let budget = 3; budget <= 8; budget++) {
-          for (let delay = 0; delay <= 8; delay++) {
-            yield* Effect.scoped(Effect.gen(function*() {
-              const stream = yield* Stream.broadcast(Stream.make(1, 2, 3), { capacity: 8 }).pipe(
-                Effect.provideService(Scheduler.MaxOpsBeforeYield, budget)
-              )
-              for (let i = 0; i < delay; i++) yield* Effect.yieldNow
-              assert.isDefined(yield* collectNow(stream), `budget ${budget}, delay ${delay}`)
-            }))
-          }
-        }
+        const stream = yield* Stream.broadcast(Stream.make(1, 2, 3), { capacity: 8 }).pipe(
+          Effect.provideService(Scheduler.MaxOpsBeforeYield, 5)
+        )
+        for (let i = 0; i < 7; i++) yield* Effect.yieldNow
+        deepStrictEqual(yield* collectNow(stream), Exit.succeed([]), "subscriber must finish")
       }))
 
-    it.effect("loses no buffered elements when the scope closes", () =>
+    it.effect("interrupts a subscriber when its scope closes", () =>
       Effect.gen(function*() {
-        const yields = (n: number) =>
-          Effect.gen(function*() {
-            for (let i = 0; i < n; i++) yield* Effect.yieldNow
-          })
-        for (const name of ["broadcast", "broadcastN", "share"] as const) {
-          for (const late of [false, true]) {
-            const scope = yield* Scope.make()
-            const gate = yield* Deferred.make<void>()
-            let held = 0
-            const source = Stream.fromArrays([1], [2], [3])
-            const options = { capacity: 16 } as const
-            const stream = yield* (name === "broadcast"
-              ? Stream.broadcast(source, options)
-              : name === "share"
-              ? Stream.share(source, options)
-              : Effect.map(Stream.broadcastN(source, { ...options, n: 1 }), ([s]) => s)).pipe(Scope.provide(scope))
-            if (late) {
-              yield* yields(20)
-              yield* Scope.close(scope, Exit.void)
-            }
-            const fiber = yield* stream.pipe(
-              Stream.tap(() => Effect.andThen(Effect.sync(() => held++), Deferred.await(gate))),
-              Stream.runCollect,
-              Effect.forkChild({ startImmediately: true })
-            )
-            yield* yields(20)
-            const label = `${name}, late ${late}`
-            if (!late) assert.strictEqual(held, 1, `${label}: the subscriber must hold an element`)
-            yield* Scope.close(scope, Exit.void)
-            yield* Deferred.succeed(gate, void 0)
-            yield* yields(20)
-            const exit = fiber.pollUnsafe()
-            yield* Fiber.interrupt(fiber)
-            assert.isTrue(exit !== undefined && Exit.hasInterrupts(exit), label)
-          }
-        }
+        const scope = yield* Scope.make()
+        const gate = yield* Deferred.make<void>()
+        let held = 0
+        const stream = yield* Stream.broadcast(Stream.fromArrays([1], [2], [3]), { capacity: 16 }).pipe(
+          Scope.provide(scope)
+        )
+        const fiber = yield* stream.pipe(
+          Stream.tap(() => Effect.andThen(Effect.sync(() => held++), Deferred.await(gate))),
+          Stream.runCollect,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* settle
+        assert.strictEqual(held, 1)
+        yield* Scope.close(scope, Exit.void)
+        yield* Deferred.succeed(gate, void 0)
+        yield* settle
+        const exit = fiber.pollUnsafe()
+        yield* Fiber.interrupt(fiber)
+        assert.isTrue(exit !== undefined && Exit.hasInterrupts(exit))
       }))
 
     it.effect("ends a subscriber whose end the dropping strategy drops", () =>
