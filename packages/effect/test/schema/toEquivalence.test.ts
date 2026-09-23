@@ -259,6 +259,45 @@ describe("toEquivalence", () => {
   })
 
   describe("suspend", () => {
+    it("compiles a recursive body once across repeated comparisons", () => {
+      interface Node {
+        readonly value: number
+        readonly children: ReadonlyArray<Node>
+      }
+      let compilations = 0
+      const Value = Schema.Number.annotate({
+        toEquivalence: () => {
+          compilations++
+          return Equivalence.strictEqual<number>()
+        }
+      })
+      const Node = Schema.Struct({
+        value: Value,
+        children: Schema.Array(Schema.suspend((): Schema.Codec<Node> => Node))
+      })
+      const make = (depth: number): Node => ({
+        value: depth,
+        children: depth === 0 ? [] : [make(depth - 1)]
+      })
+      const equivalence = Schema.toEquivalence(Node)
+      assertTrue(equivalence(make(8), make(8)))
+      assertFalse(equivalence(make(8), { value: 8, children: [make(6)] }))
+      assertTrue(equivalence(make(4), make(4)))
+      strictEqual(compilations, 1)
+    })
+
+    it("keeps distinct suspended targets with the same AST tag separate", () => {
+      const Left = Schema.Struct({ left: Schema.String })
+      const Right = Schema.Struct({ right: Schema.String })
+      const left = Schema.toEquivalence(Schema.suspend((): typeof Left => Left))
+      const right = Schema.toEquivalence(Schema.suspend((): typeof Right => Right))
+
+      assertTrue(left({ left: "a" }, { left: "a" }))
+      assertFalse(left({ left: "a" }, { left: "b" }))
+      assertTrue(right({ right: "a" }, { right: "a" }))
+      assertFalse(right({ right: "a" }, { right: "b" }))
+    })
+
     it("recursive schema", () => {
       interface A {
         readonly a: string
